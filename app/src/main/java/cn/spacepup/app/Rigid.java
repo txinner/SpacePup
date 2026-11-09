@@ -38,6 +38,12 @@ final class Rigid {
     }
     double distance(Rigid b) {return norm(sub(t,b.t));}
     double angle(Rigid b) {return 2*Math.acos(Math.min(1,Math.abs(dot(q,b.q))));}
+    Rigid blend(Rigid other,double fraction) {
+        double sign=dot(q,other.q)<0?-1:1;
+        double[] rotation=new double[4];
+        for(int i=0;i<4;i++)rotation[i]=(1-fraction)*q[i]+fraction*sign*other.q[i];
+        return new Rigid(add(scale(t,1-fraction),scale(other.t,fraction)),rotation);
+    }
     static Rigid yaw(double[] position,double angle) { return new Rigid(position,new double[]{0,Math.sin(angle/2),0,Math.cos(angle/2)}); }
     Rigid leveled() {
         double[] forward=rotate(new double[]{0,0,-1});

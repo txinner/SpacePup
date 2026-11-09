@@ -22,11 +22,13 @@ final class Engine implements GLSurfaceView.Renderer {
     final Scene scene=new Scene();
     volatile Mode mode=Mode.HOME;
     private Session session;private boolean resumed,suspended;
-    private Anchor origin;private Vision vision,validator;private Space space;
+    private Anchor origin, placedDog;private Vision vision,validator;private Space space;
     private Rigid validationStart;
     private long validationSince;
     private int width=1,height=1,rotation;
     private Rigid mapCamera, stationary, latestSensor;
+    private final MapRefresh mapRefresh=new MapRefresh();
+    private long lastMapMatch;
     private final float[] projection=new float[16];
     private long sampleTime,uiTime,previousFrame,stationarySince;
     private boolean place, setOrigin, closeAfterFix=true;
@@ -45,24 +47,38 @@ final class Engine implements GLSurfaceView.Renderer {
         scene.init();if(session!=null)session.setCameraTextureName(scene.texture);
     }
     public void onSurfaceChanged(GL10 gl,int w,int h){
-        width=w;height=h;glViewport(0,0,w,h);if(session!=null)session.setDisplayGeometry(rotation,w,h);
+        width=w;height=h;glViewport(0,0,w,h);scene.invalidateCameraGeometry();
+        if(session!=null)session.setDisplayGeometry(rotation,w,h);
     }
     void start(Space target,boolean creating,int displayRotation,Tracking tracking){
         reset();suspended=false;trace.clear();traceTime=0;lastCorrection=Double.NaN;space=target;rotation=displayRotation;
         closeAfterFix=tracking!=Tracking.LIVE_CAMERA;
         autoCorrect=tracking==Tracking.AUTO_CORRECT;autoAttemptUsed=false;automaticSearch=false;
-        mode=creating?Mode.ORIGIN:Mode.SEARCH;motion.start();openCamera();
+        mode=creating?Mode.ORIGIN:Mode.SEARCH;
+        if(closeAfterFix && !creating)motion.start();
+        openCamera();
     }
     private void openCamera(){
         try{
             vision=new Vision();session=new Session(context);
+            CameraConfigFilter filter=new CameraConfigFilter(session)
+                .setTargetFps(EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30))
+                .setDepthSensorUsage(EnumSet.of(CameraConfig.DepthSensorUsage.DO_NOT_USE));
+            List<CameraConfig> cameras=session.getSupportedCameraConfigs(filter);
+            if(cameras.isEmpty()){
+                filter.setDepthSensorUsage(EnumSet.allOf(CameraConfig.DepthSensorUsage.class));
+                cameras=session.getSupportedCameraConfigs(filter);
+            }
+            if(!cameras.isEmpty())session.setCameraConfig(cameras.get(0));
             Config config=new Config(session);config.setFocusMode(Config.FocusMode.AUTO);
             config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
             config.setLightEstimationMode(Config.LightEstimationMode.DISABLED);
             config.setPlaneFindingMode(mode==Mode.ORIGIN || mode==Mode.SCAN?Config.PlaneFindingMode.HORIZONTAL:Config.PlaneFindingMode.DISABLED);
             session.configure(config);session.setCameraTextureName(scene.texture);
+            scene.invalidateCameraGeometry();
             session.setDisplayGeometry(rotation,width,height);session.resume();resumed=true;
             sampleTime=0;previousFrame=0;stationarySince=0;stationary=null;mapCamera=null;searchStarted=SystemClock.elapsedRealtime();
+            lastMapMatch=0;mapRefresh.reset(0,false);
         }catch(Exception | LinkageError e){
             if(canReturnToImu){returnToImu();ui.message("相机暂时不可用，已恢复惯性估计");}
             else fail(e);
@@ -109,11 +125,9 @@ final class Engine implements GLSurfaceView.Renderer {
         if(mode!=Mode.SEARCH || !canReturnToImu)return;
         releaseCamera();mode=Mode.INERTIAL;oldEstimate=null;canReturnToImu=false;automaticSearch=false;uiTime=0;
     }
-    void requestSleep(){
-        if(mode==Mode.VISUAL){closeAfterFix=true;stationary=null;stationarySince=0;}
-    }
     private void releaseCamera(){
         endValidation();
+        if(placedDog!=null){placedDog.detach();placedDog=null;}
         if(origin!=null){origin.detach();origin=null;}
         if(session!=null){try{if(resumed)session.pause();}finally{session.close();session=null;resumed=false;}}
         if(vision!=null){vision.close();vision=null;}
@@ -138,7 +152,7 @@ final class Engine implements GLSurfaceView.Renderer {
     void resumeForeground(){
         if(mode==Mode.HOME)return;
         suspended=false;
-        motion.start();
+        if(closeAfterFix && mode!=Mode.SCAN && mode!=Mode.ORIGIN || mode==Mode.INERTIAL)motion.start();
         if(mode==Mode.INERTIAL)return;
         if(session==null){openCamera();return;}
         if(!resumed)try{session.resume();resumed=true;}catch(Exception e){fail(e);}
@@ -173,8 +187,8 @@ final class Engine implements GLSurfaceView.Renderer {
             Frame frame=session.update();Camera cam=frame.getCamera();long ts=frame.getTimestamp();
             if(ts==0)return;
             scene.background(frame);
-            if(cam.getTrackingState()!=TrackingState.TRACKING || origin!=null && origin.getTrackingState()!=TrackingState.TRACKING){
-                if(vision!=null){vision.confirmations=0;vision.candidate=null;}
+            if(cam.getTrackingState()!=TrackingState.TRACKING || mode==Mode.SCAN && origin.getTrackingState()!=TrackingState.TRACKING){
+                vision.resetConfirmation();
                 stationary=null;
                 report("视觉跟踪尚未就绪","缓慢移动手机，对准有纹理的物体 · "+cam.getTrackingFailureReason());return;
             }
@@ -186,9 +200,16 @@ final class Engine implements GLSurfaceView.Renderer {
                 }
                 if(mode==Mode.ORIGIN){report("设定空间原点","选好起点，将手机镜头朝向空间正前方");return;}
             }
-            Rigid mapAR=origin==null?null:from(origin.getPose()).inverse();
+            Rigid mapAR=null;
+            if(origin!=null && origin.getTrackingState()==TrackingState.TRACKING){
+                Rigid arFromAnchor=from(origin.getPose());
+                mapAR=mode==Mode.SCAN?arFromAnchor.inverse():space.dog.times(arFromAnchor.inverse());
+            }
             if(mode==Mode.SCAN){
                 if(place){place=false;placeDog(frame,mapAR,arCamera);}
+                if(placedDog!=null && placedDog.getTrackingState()==TrackingState.TRACKING){
+                    space.dog=mapAR.times(from(placedDog.getPose()));
+                }
                 mapCamera=mapAR.times(from(cam.getDisplayOrientedPose()));
                 if(validator!=null){
                     scene.renderDog(projection,mapCamera,space.dog);
@@ -205,10 +226,13 @@ final class Engine implements GLSurfaceView.Renderer {
                     try(Vision.Shot shot=capture(frame,cam,arCamera)){
                         if(shot!=null){Rigid fix=vision.locate(shot,space,ts);
                             if(fix!=null){
-                                origin=session.createAnchor(toPose(fix.inverse()));mapAR=fix;
+                                anchorDog(fix);mapAR=fix;
                                 mode=Mode.VISUAL;stationary=null;canReturnToImu=false;automaticSearch=false;
+                                vision.resetConfirmation();lastMapMatch=ts;
+                                mapRefresh.reset(ts,space.nearMappedView(fix.point(arCamera.t)));
                                 if(oldEstimate!=null){Rigid estimateNow=motion.display();
                                     lastCorrection=fix.times(from(cam.getDisplayOrientedPose())).distance(estimateNow==null?oldEstimate:estimateNow);oldEstimate=null;}
+                                if(!closeAfterFix)motion.stop();
                             }
                         }
                     }
@@ -216,11 +240,17 @@ final class Engine implements GLSurfaceView.Renderer {
                 if(mode==Mode.SEARCH){report("正在找回「"+space.name+"」",
                     "对准扫描过的家具或墙角，慢慢移动\n匹配内点 "+vision.inliers+"　画面分区 "+vision.sectors+"　连续验证 "+vision.confirmations+" / 3");return;}
             }
-            if(mode==Mode.VISUAL && mapAR!=null){
-                Rigid display=from(cam.getDisplayOrientedPose()),sensor=from(frame.getAndroidSensorPose());
-                mapCamera=mapAR.times(display);latestSensor=mapAR.times(sensor);
+            if(mode==Mode.VISUAL){
+                if(!closeAfterFix)mapAR=correctAgainstMap(frame,cam,arCamera,mapAR,ts);
+                if(mapAR==null){
+                    report("正在找回小狗的位置","对准放置小狗时看到的地面、墙角或家具。");return;
+                }
+                Rigid display=from(cam.getDisplayOrientedPose());
+                mapCamera=mapAR.times(display);
                 scene.renderDog(projection,mapCamera,space.dog);
                 if(closeAfterFix && previousFrame!=ts){
+                    Rigid sensor=from(frame.getAndroidSensorPose());
+                    latestSensor=mapAR.times(sensor);
                     if(stationary==null || latestSensor.distance(stationary)>0.018 || latestSensor.angle(stationary)>Math.toRadians(2)){
                         stationary=latestSensor;stationarySince=ts;
                     }else if(ts-stationarySince>600000000L){
@@ -234,15 +264,72 @@ final class Engine implements GLSurfaceView.Renderer {
                         if(ts-stationarySince>2500000000L){closeAfterFix=false;ui.message("缺少可同步的惯性数据，已保持视觉定位");}
                     }
                 }
-                report(closeAfterFix?"已定位 · 请稳住手机以关闭相机":"已定位 · 实景查看",
-                    poseText()+(Double.isFinite(lastCorrection)?String.format(Locale.CHINA,"\n上次视觉校正 %.2f m",lastCorrection):""));
+                String status=closeAfterFix?"已定位 · 请稳住手机以关闭相机":
+                    mapRefresh.inside?"持续视觉定位 · 扫描区内":"视觉跟踪 · 扫描区外";
+                String matchStatus=!closeAfterFix && mapRefresh.inside && ts-lastMapMatch>12000000000L
+                    ?"\n等待自动匹配已扫描特征":"";
+                report(status,poseText()+matchStatus+(Double.isFinite(lastCorrection)?
+                    String.format(Locale.CHINA,"\n上次视觉校正 %.2f m",lastCorrection):""));
                 record();
             }
             previousFrame=ts;
         }catch(Exception | LinkageError e){fail(e);}
     }
+    private void anchorDog(Rigid mapFromAr){
+        Anchor replacement=session.createAnchor(toPose(mapFromAr.inverse().times(space.dog)));
+        if(origin!=null)origin.detach();
+        origin=replacement;
+    }
+    private Rigid correctAgainstMap(Frame frame,Camera cam,Rigid arCamera,Rigid mapAR,long ts){
+        boolean wasInside=mapRefresh.inside;
+        boolean inside=mapAR!=null && space.nearMappedView(mapAR.point(arCamera.t),wasInside);
+        MapRefresh.Work work=mapRefresh.next(ts,mapAR!=null,inside);
+        if(wasInside!=mapRefresh.inside)vision.resetConfirmation();
+        if(work==MapRefresh.Work.NONE)return mapAR;
+
+        boolean lightweight=work==MapRefresh.Work.LIGHT;
+        try(Vision.Shot shot=capture(frame,cam,arCamera,lightweight)){
+            if(shot==null)return mapAR;
+            if(lightweight){
+                Rigid check=vision.lightFix(shot,space);
+                if(check!=null){
+                    if(mapAR==null || dogShift(mapAR,check)>.035 || mapAR.angle(check)>Math.toRadians(1.3)){
+                        mapRefresh.startFull(ts);
+                    }else lastMapMatch=ts;
+                }
+                vision.resetConfirmation();
+                return mapAR;
+            }
+            Rigid fix=vision.locate(shot,space,ts,true);
+            if(fix==null)return mapAR;
+            vision.resetConfirmation();
+            if(mapAR==null){
+                anchorDog(fix);lastMapMatch=ts;
+                mapRefresh.reset(ts,space.nearMappedView(fix.point(arCamera.t)));
+                return fix;
+            }
+            double cameraShift=mapAR.times(arCamera).distance(fix.times(arCamera));
+            double angle=mapAR.angle(fix);
+            boolean largeShift=cameraShift>1.5 || angle>Math.toRadians(25);
+            if(largeShift && (vision.inliers<40 || vision.sectors<6 || vision.reprojectionError>1.8))return mapAR;
+            double shift=dogShift(mapAR,fix);
+            lastMapMatch=ts;mapRefresh.finish(ts);
+            if(shift>.02 || angle>Math.toRadians(0.8)){
+                anchorDog(fix);lastCorrection=shift;mapAR=fix;
+            }
+            return mapAR;
+        }
+    }
+    private double dogShift(Rigid before,Rigid after){
+        double[] previous=before.inverse().point(space.dog.t);
+        double[] corrected=after.inverse().point(space.dog.t);
+        return Rigid.norm(Rigid.sub(previous,corrected));
+    }
     private Vision.Shot capture(Frame frame,Camera cam,Rigid pose){
-        try(Image img=frame.acquireCameraImage()){return vision.capture(img,cam.getImageIntrinsics(),pose);}
+        return capture(frame,cam,pose,false);
+    }
+    private Vision.Shot capture(Frame frame,Camera cam,Rigid pose,boolean probe){
+        try(Image img=frame.acquireCameraImage()){return vision.capture(img,cam.getImageIntrinsics(),pose,probe);}
         catch(NotYetAvailableException e){return null;}
     }
     private void placeDog(Frame frame,Rigid mapAR,Rigid arCamera){
@@ -251,7 +338,10 @@ final class Engine implements GLSurfaceView.Renderer {
             Plane plane=(Plane)hit.getTrackable();
             if(plane.getType()!=Plane.Type.HORIZONTAL_UPWARD_FACING || !plane.isPoseInPolygon(hit.getHitPose()))continue;
             double[] foot=mapAR.point(from(hit.getHitPose()).t),head=mapAR.point(arCamera.t);
-            space.dog=Rigid.yaw(foot,Math.atan2(head[0]-foot[0],head[2]-foot[2]));return;
+            space.dog=Rigid.yaw(foot,Math.atan2(head[0]-foot[0],head[2]-foot[2]));
+            Anchor replacement=session.createAnchor(toPose(mapAR.inverse().times(space.dog)));
+            if(placedDog!=null)placedDog.detach();
+            placedDog=replacement;return;
         }
         ui.message("尚未识别准星处的水平面。向侧面移动，再对准地面或桌面");
     }

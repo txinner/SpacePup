@@ -10,6 +10,9 @@ import java.util.ArrayList;
 
 final class Scene {
     int texture,bg,mesh,vertices;
+    private int quadPosition, textureCoordinates, cameraSampler, dogPosition, dogColor, dogMvp;
+    private boolean cameraGeometryDirty=true;
+    private final float[] mvp=new float[16];
     FloatBuffer dog;
     final FloatBuffer quad=buffer(new float[]{-1,-1,1,-1,-1,1,1,1});
     final FloatBuffer uv=buffer(new float[8]);
@@ -33,6 +36,13 @@ final class Scene {
             "#extension GL_OES_EGL_image_external : require\nprecision mediump float;uniform samplerExternalOES camera;varying vec2 tc;void main(){gl_FragColor=texture2D(camera,tc);}");
         mesh=program("uniform mat4 mvp;attribute vec3 pos;attribute vec3 color;varying vec3 rgb;void main(){rgb=color;gl_Position=mvp*vec4(pos,1.);}",
             "precision mediump float;varying vec3 rgb;void main(){gl_FragColor=vec4(rgb,1.);}");
+        quadPosition=glGetAttribLocation(bg,"pos");
+        textureCoordinates=glGetAttribLocation(bg,"uv");
+        cameraSampler=glGetUniformLocation(bg,"camera");
+        dogPosition=glGetAttribLocation(mesh,"pos");
+        dogColor=glGetAttribLocation(mesh,"color");
+        dogMvp=glGetUniformLocation(mesh,"mvp");
+        invalidateCameraGeometry();
         int[] tex=new int[1];glGenTextures(1,tex,0);texture=tex[0];glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,texture);
         glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
         glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
@@ -40,27 +50,31 @@ final class Scene {
         glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
         Model model=new Model();dog=buffer(model.build());vertices=dog.capacity()/6;
     }
+    void invalidateCameraGeometry(){cameraGeometryDirty=true;}
     void background(Frame frame){
-        quad.position(0);uv.position(0);
-        frame.transformCoordinates2d(Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,quad,Coordinates2d.TEXTURE_NORMALIZED,uv);
+        if(cameraGeometryDirty || frame.hasDisplayGeometryChanged()){
+            quad.position(0);uv.position(0);
+            frame.transformCoordinates2d(Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,quad,Coordinates2d.TEXTURE_NORMALIZED,uv);
+            cameraGeometryDirty=false;
+        }
         glDisable(GL_DEPTH_TEST);glDepthMask(false);glUseProgram(bg);glActiveTexture(GL_TEXTURE0);glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,texture);
-        glUniform1i(glGetUniformLocation(bg,"camera"),0);
-        attr(bg,"pos",quad,2,0,0);attr(bg,"uv",uv,2,0,0);glDrawArrays(GL_TRIANGLE_STRIP,0,4);
-        disable(bg,"pos","uv");glDepthMask(true);
+        glUniform1i(cameraSampler,0);
+        attr(quadPosition,quad,2,0,0);attr(textureCoordinates,uv,2,0,0);glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+        glDisableVertexAttribArray(quadPosition);glDisableVertexAttribArray(textureCoordinates);glDepthMask(true);
     }
     void renderDog(float[] projection,Rigid mapCamera,Rigid dogAnchor){
         if(mapCamera==null || dogAnchor==null)return;
-        float[] viewModel=mapCamera.inverse().times(dogAnchor).matrix(),mvp=new float[16];
+        float[] viewModel=mapCamera.inverse().times(dogAnchor).matrix();
         Matrix.multiplyMM(mvp,0,projection,0,viewModel,0);
         glEnable(GL_DEPTH_TEST);glUseProgram(mesh);
-        glUniformMatrix4fv(glGetUniformLocation(mesh,"mvp"),1,false,mvp,0);
-        attr(mesh,"pos",dog,3,24,0);attr(mesh,"color",dog,3,24,3);
-        glDrawArrays(GL_TRIANGLES,0,vertices);disable(mesh,"pos","color");
+        glUniformMatrix4fv(dogMvp,1,false,mvp,0);
+        attr(dogPosition,dog,3,24,0);attr(dogColor,dog,3,24,3);
+        glDrawArrays(GL_TRIANGLES,0,vertices);
+        glDisableVertexAttribArray(dogPosition);glDisableVertexAttribArray(dogColor);
     }
-    static void attr(int program,String name,FloatBuffer b,int size,int stride,int offset){
-        int loc=glGetAttribLocation(program,name);b.position(offset);glEnableVertexAttribArray(loc);glVertexAttribPointer(loc,size,GL_FLOAT,false,stride,b);
+    static void attr(int location,FloatBuffer b,int size,int stride,int offset){
+        b.position(offset);glEnableVertexAttribArray(location);glVertexAttribPointer(location,size,GL_FLOAT,false,stride,b);
     }
-    static void disable(int program,String... names){for(String n:names)glDisableVertexAttribArray(glGetAttribLocation(program,n));}
 
     /** Hand-built low-poly terrier, +Z is the nose, feet at y=0. Size is measured in metres. */
     static final class Model{

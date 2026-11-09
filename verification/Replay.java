@@ -44,6 +44,22 @@ public final class Replay {
         System.out.printf(Locale.ROOT,"Map: %d landmarks, %d useful views, extent %.2f m%n",map.points.size(),map.usefulViews,map.extent);
         require(map.quality(),"multi-view quality");map.dog=Rigid.yaw(new double[]{.7,-.85,-1.9},1.1);
         map.save(dir.toFile());Space loaded=Space.load(map.file(dir.toFile()));
+        require(!loaded.views.isEmpty() && loaded.nearMappedView(new double[]{.55,0,0}),"scan coverage lost on reload");
+        require(!loaded.nearMappedView(new double[]{0,-3,0}),"next floor classified as scan coverage");
+        byte[] legacyBytes=Arrays.copyOf(Files.readAllBytes(map.file(dir.toFile()).toPath()),
+            (int)map.file(dir.toFile()).length()-4-loaded.views.size()*12);
+        java.nio.ByteBuffer legacy=java.nio.ByteBuffer.wrap(legacyBytes);
+        legacy.putInt(0,0x50555031);
+        java.util.zip.CRC32 crc=new java.util.zip.CRC32();
+        crc.update(legacyBytes,0,legacyBytes.length-8);
+        legacy.putLong(legacyBytes.length-8,crc.getValue());
+        Path legacyFile=Files.createTempFile(dir,"legacy-",".pup");
+        try{
+            Files.write(legacyFile,legacyBytes);
+            Space oldMap=Space.load(legacyFile.toFile());
+            require(oldMap.views.isEmpty() && oldMap.nearMappedView(new double[]{.55,0,0})
+                && oldMap.points.size()==loaded.points.size(),"legacy map incompatible");
+        }finally{Files.deleteIfExists(legacyFile);}
         require(loaded.points.size()==map.points.size() && loaded.dog.angle(map.dog)<1e-6 && loaded.dog.distance(map.dog)<1e-6,"anchor reload");
         Rigid truth=Rigid.yaw(new double[]{1.8,.28,-.7},.64);
         try(Vision finder=new Vision()){
@@ -78,6 +94,35 @@ public final class Replay {
             }
             try(Vision.Shot blank=finder.extract(new byte[W*H],W,H,F,C,Rigid.ID)){
                 require(finder.locate(blank,loaded,6000000000L)==null,"blank frame");
+            }
+            // Keep the same AR session but inject a drift after walking away and returning.
+            finder.resetConfirmation();
+            Rigid afterWalk=Rigid.yaw(new double[]{2.15,.36,-.87},.75);
+            Rigid checkView=Rigid.yaw(new double[]{.54,.015,-.02},.05);
+            Rigid arCheckView=afterWalk.inverse().times(checkView);
+            try(Vision.Shot shot=finder.extract(room(checkView,11),W,H,F,C,arCheckView,true)){
+                Rigid check=finder.lightFix(shot,loaded);
+                require(shot.keys.length<=280 && check!=null
+                    && check.times(arCheckView).distance(truth.times(arCheckView))>.20,
+                    "lightweight match did not detect return drift");
+            }
+            for(int i=0;i<3;i++){
+                Rigid physical=Rigid.yaw(new double[]{.54+i*.015,.015,-.02},.05);
+                Rigid arCamera=afterWalk.inverse().times(physical);
+                try(Vision.Shot shot=finder.extract(room(physical,11),W,H,F,C,arCamera)){
+                    long timestamp=8000000000L+i*300000000L;
+                    Rigid correction=finder.locate(shot,loaded,timestamp,true);
+                    if(i<2)require(correction==null,"loop correction accepted before three frames");
+                    if(i==0)require(finder.locate(shot,loaded,timestamp,true)==null,"duplicate frame counted");
+                    if(i==2){
+                        require(correction!=null,"return to placement view was not recognized");
+                        double[] expected=physical.inverse().point(loaded.dog.t);
+                        double before=Rigid.norm(Rigid.sub(truth.times(arCamera).inverse().point(loaded.dog.t),expected));
+                        double after=Rigid.norm(Rigid.sub(correction.times(arCamera).inverse().point(loaded.dog.t),expected));
+                        require(before>.20 && after<.08,"dog remained offset after loop correction");
+                        System.out.printf(Locale.ROOT,"Loop dog alignment: %.3f m before, %.3f m after (synthetic)%n",before,after);
+                    }
+                }
             }
         }
         Path file=map.file(dir.toFile()).toPath();byte[] bytes=Files.readAllBytes(file);bytes[bytes.length-12]^=4;Files.write(file,bytes);
@@ -144,12 +189,32 @@ public final class Replay {
         for(int i=0;i<1550;i++){ns+=20000000;nav.advance(ns,new double[3],false,0);}
         require(!nav.positionUsable(),"inertial window did not expire");
     }
+    static void refreshSchedule(){
+        long second=1_000_000_000L;
+        MapRefresh refresh=new MapRefresh();
+        refresh.reset(second,true);
+        require(refresh.next(5*second,true,true)==MapRefresh.Work.NONE,"early in-map check");
+        require(refresh.next(6*second,true,true)==MapRefresh.Work.LIGHT,"missing first light check");
+        require(refresh.next(11*second,true,true)==MapRefresh.Work.LIGHT,"missing periodic light check");
+        require(refresh.next(20*second,true,false)==MapRefresh.Work.NONE,"map matched outside");
+        require(refresh.next(35*second,true,false)==MapRefresh.Work.NONE,"repeated map matching outside");
+        require(refresh.next(36*second,true,true)==MapRefresh.Work.FULL,"re-entry did not start full match");
+        require(refresh.next(36*second,true,true)==MapRefresh.Work.NONE,"same camera frame matched twice");
+        require(refresh.next(36*second+300_000_000L,true,true)==MapRefresh.Work.FULL,"re-entry burst missing next sample");
+        refresh.finish(37*second);
+        require(refresh.next(38*second,true,true)==MapRefresh.Work.NONE,"re-entry repeated full match");
+        require(refresh.next(42*second,true,true)==MapRefresh.Work.LIGHT,"periodic check not restored");
+        refresh.startFull(42*second);
+        require(refresh.next(42*second+100_000_000L,true,true)==MapRefresh.Work.FULL,"drift did not trigger full match");
+        require(refresh.next(45*second,true,true)==MapRefresh.Work.NONE,"unsuccessful full match did not stop");
+        require(refresh.next(47*second,true,true)==MapRefresh.Work.LIGHT,"unsuccessful correction did not retry lightly");
+    }
     public static void main(String[] args)throws Exception{
         System.load(args[0]);run(Files.createTempDirectory("spacepup-replay-"));
     }
     static int run(Path dir)throws Exception{
         checks=0;
-        try{vision(dir);motion();stairs();driftGuard();System.out.println("PASS · "+checks+" checks");return checks;}
+        try{vision(dir);motion();stairs();driftGuard();refreshSchedule();System.out.println("PASS · "+checks+" checks");return checks;}
         finally{Files.deleteIfExists(dir.resolve("fixture.pup"));Files.deleteIfExists(dir);}
     }
 }

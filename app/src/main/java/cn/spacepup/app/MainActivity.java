@@ -31,7 +31,8 @@ public final class MainActivity extends Activity implements Engine.Listener {
     private final Runnable tick=new Runnable(){public void run(){
         if(!foreground || !inSession)return;
         surface.requestRender();
-        handler.postDelayed(this,engine.mode==Engine.Mode.INERTIAL?64:32);
+        Engine.Mode current=engine.mode;
+        handler.postDelayed(this,current==Engine.Mode.VISUAL?100:current==Engine.Mode.INERTIAL?64:32);
     }};
     @Override public void onCreate(Bundle state){
         super.onCreate(state);getWindow().setStatusBarColor(INK);getWindow().setNavigationBarColor(INK);
@@ -90,8 +91,8 @@ public final class MainActivity extends Activity implements Engine.Listener {
             }).show();
     }
     private void select(File file,String name){
-        Engine.Tracking[] choices={Engine.Tracking.AUTO_CORRECT,Engine.Tracking.MANUAL_CORRECT,Engine.Tracking.LIVE_CAMERA};
-        String[] labels={"定位后关相机，需要时自动校正","定位后关相机，手动校正","实景查看小狗"};
+        Engine.Tracking[] choices={Engine.Tracking.LIVE_CAMERA,Engine.Tracking.AUTO_CORRECT,Engine.Tracking.MANUAL_CORRECT};
+        String[] labels={"持续视觉定位","定位后关相机，需要时自动校正","定位后关相机，手动校正"};
         new AlertDialog.Builder(this).setTitle(name).setItems(labels,(d,index)->{
             try{queue(Space.load(file),false,choices[index]);}
             catch(Exception e){dialog("地图读取失败",e.getMessage());}
@@ -144,7 +145,6 @@ public final class MainActivity extends Activity implements Engine.Listener {
         if(m==Engine.Mode.SCAN){action("放置小狗",false,engine::actionPlace);save=action("保存空间",true,engine::save);}
         if(m==Engine.Mode.INERTIAL){action("视觉校正",true,()->engine.recalibrate(true));action("实景查看",false,()->engine.recalibrate(false));}
         if(m==Engine.Mode.SEARCH && engine.canReturnToImu)action("继续惯性跟踪",false,engine::returnToImu);
-        if(m==Engine.Mode.VISUAL)action("关闭相机",true,engine::requestSleep);
         Button exit=button("返回空间列表",false,this::exitSession);add(bottom,exit,actions.getChildCount()>0?8:0);
     }
     private Button action(String title,boolean primary,Runnable run){

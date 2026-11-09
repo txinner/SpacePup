@@ -11,7 +11,7 @@ $out=Join-Path $project 'build/replay'
 New-Item -ItemType Directory -Force $out | Out-Null
 $classpath=@($out,$AndroidJar,$ArCoreJar,$OpenCvJar) -join [IO.Path]::PathSeparator
 $source=Join-Path $project 'app/src/main/java/cn/spacepup/app'
-$files=@('Rigid','Vision','Space','DeadReckoner') | ForEach-Object {Join-Path $source "$_.java"}
+$files=@('Rigid','Vision','Space','DeadReckoner','MapRefresh') | ForEach-Object {Join-Path $source "$_.java"}
 & (Join-Path $Jdk 'bin/javac.exe') -encoding UTF-8 -cp $classpath -d $out @files (Join-Path $PSScriptRoot 'Replay.java')
 if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
 $env:OPENCV_OPENCL_RUNTIME='disabled'

@@ -11,10 +11,15 @@ import java.util.*;
 /** CPU image coordinates always use the physical, unrotated camera and its CPU intrinsics. */
 final class Vision implements AutoCloseable {
     final ORB orb=ORB.create(1000);
+    final ORB probeOrb=ORB.create(280);
     final BFMatcher matcher=BFMatcher.create(Core.NORM_HAMMING,false);
     final ArrayDeque<Shot> history=new ArrayDeque<>();
+    private final Mat gray=new Mat(), noMask=new Mat();
+    private final MatOfKeyPoint detectedKeys=new MatOfKeyPoint();
+    private byte[] luminance=new byte[0];
     Mat mapDescriptors;
     int inliers, sectors;
+    double reprojectionError;
     long lastGoodTime;
     Rigid candidate;
     int confirmations;
@@ -31,21 +36,36 @@ final class Vision implements AutoCloseable {
         public void close(){desc.release();}
     }
     Shot capture(Image image,CameraIntrinsics intr,Rigid pose){
+        return capture(image,intr,pose,false);
+    }
+    Shot capture(Image image,CameraIntrinsics intr,Rigid pose,boolean probe){
         int w=image.getWidth(),h=image.getHeight(); Image.Plane y=image.getPlanes()[0];
         int stride=y.getRowStride(),step=y.getPixelStride(); ByteBuffer data=y.getBuffer().duplicate();
-        byte[] pixels=new byte[w*h];int offset=data.position();
-        for(int row=0;row<h;row++){
-            if(step==1){data.position(offset+row*stride);data.get(pixels,row*w,w);}
-            else for(int col=0;col<w;col++) pixels[row*w+col]=data.get(offset+row*stride+col*step);
+        if(luminance.length!=w*h)luminance=new byte[w*h];
+        if(step==1 && stride==w){
+            data.get(luminance);
+        }else{
+            int offset=data.position();
+            for(int row=0;row<h;row++){
+                if(step==1){data.position(offset+row*stride);data.get(luminance,row*w,w);}
+                else for(int col=0;col<w;col++)luminance[row*w+col]=data.get(offset+row*stride+col*step);
+            }
         }
-        return extract(pixels,w,h,intr.getFocalLength(),intr.getPrincipalPoint(),pose);
+        return extract(luminance,w,h,intr.getFocalLength(),intr.getPrincipalPoint(),pose,probe);
     }
     Shot extract(byte[] pixels,int w,int h,float[] focal,float[] center,Rigid pose){
-        Mat gray=new Mat(h,w,CvType.CV_8U),mask=new Mat(),desc=new Mat();
-        MatOfKeyPoint keys=new MatOfKeyPoint();
-        try{gray.put(0,0,pixels);orb.detectAndCompute(gray,mask,keys,desc);return new Shot(pose,keys.toArray(),desc,focal,center,w,h);}
+        return extract(pixels,w,h,focal,center,pose,false);
+    }
+    Shot extract(byte[] pixels,int w,int h,float[] focal,float[] center,Rigid pose,boolean lightweight){
+        ORB detector=lightweight?probeOrb:orb;
+        gray.create(h,w,CvType.CV_8U);
+        Mat desc=new Mat();
+        try{
+            gray.put(0,0,pixels);
+            detector.detectAndCompute(gray,noMask,detectedKeys,desc);
+            return new Shot(pose,detectedKeys.toArray(),desc,focal,center,w,h);
+        }
         catch(RuntimeException e){desc.release();throw e;}
-        finally{gray.release();mask.release();keys.release();}
     }
     private List<DMatch> matches(Mat query,Mat train){
         ArrayList<DMatch> result=new ArrayList<>();
@@ -78,28 +98,48 @@ final class Vision implements AutoCloseable {
         }
         if(space.points.size()-before>=8)space.usefulViews++;
         space.extent=Math.max(space.extent,Rigid.norm(s.pose.t));
+        space.recordView(s.pose);
         space.frames++;history.addLast(s);if(history.size()>14)history.removeFirst().close();
     }
-    /** Stable transform from this fresh AR session to the saved map, verified across distinct frames. */
+    /** Stable transform from this AR session to the saved map, verified across distinct frames. */
     Rigid locate(Shot s,Space space,long time){
+        return locate(s,space,time,false);
+    }
+    Rigid locate(Shot s,Space space,long time,boolean correction){
+        Rigid pose=solve(s,space,matches(s.desc,descriptors(space)),240);
+        if(pose==null || correction && (inliers<24 || sectors<5 || reprojectionError>2.2)){
+            resetConfirmation();return null;
+        }
+        Rigid mapFromAR=pose.times(s.pose.inverse());
+        // Both frames have gravity-aligned Y axes. Reject upright/ceiling aliases.
+        if(mapFromAR.rotate(new double[]{0,1,0})[1]<0.97){resetConfirmation();return null;}
+        if(candidate!=null && time<=lastGoodTime)return null;
+        boolean agrees=candidate!=null && time-lastGoodTime<1500000000L
+            && Rigid.norm(Rigid.sub(candidate.point(s.pose.t),pose.t))<(correction?0.09:0.13)
+            && candidate.angle(mapFromAR)<Math.toRadians(correction?4:6);
+        confirmations=agrees?Math.min(confirmations+1,3):1;
+        candidate=agrees?candidate.blend(mapFromAR,1.0/confirmations):mapFromAR;
+        lastGoodTime=time;
+        return confirmations>=3?candidate:null;
+    }
+    Rigid lightFix(Shot shot,Space space){
+        Rigid pose=solve(shot,space,matches(shot.desc,descriptors(space)),80);
+        if(pose==null || inliers<18 || sectors<5 || reprojectionError>2.2)return null;
+        Rigid mapFromAr=pose.times(shot.pose.inverse());
+        return mapFromAr.rotate(new double[]{0,1,0})[1]>=.97?mapFromAr:null;
+    }
+    private Mat descriptors(Space space){
         if(mapDescriptors==null){
             mapDescriptors=new Mat(space.points.size(),32,CvType.CV_8U);
             byte[] bytes=new byte[32*space.points.size()];
             for(int i=0;i<space.points.size();i++)System.arraycopy(space.points.get(i).descriptor,0,bytes,32*i,32);
             mapDescriptors.put(0,0,bytes);
         }
-        Rigid pose=solve(s,space,matches(s.desc,mapDescriptors));
-        if(pose==null){confirmations=0;candidate=null;return null;}
-        Rigid mapFromAR=pose.times(s.pose.inverse());
-        // Both frames have gravity-aligned Y axes. Reject upright/ceiling aliases.
-        if(mapFromAR.rotate(new double[]{0,1,0})[1]<0.97){confirmations=0;candidate=null;return null;}
-        if(candidate!=null && time>lastGoodTime && time-lastGoodTime<1500000000L && candidate.distance(mapFromAR)<0.13 && candidate.angle(mapFromAR)<Math.toRadians(6))confirmations++;
-        else confirmations=1;
-        lastGoodTime=time;candidate=mapFromAR;
-        return confirmations>=3?mapFromAR:null;
+        return mapDescriptors;
     }
-    private Rigid solve(Shot s,Space space,List<DMatch> matches){
-        inliers=0;sectors=0;
+    void resetConfirmation(){confirmations=0;candidate=null;}
+    private Rigid solve(Shot s,Space space,List<DMatch> matches,int iterations){
+        inliers=0;sectors=0;reprojectionError=Double.POSITIVE_INFINITY;
         if(matches.size()<14)return null;
         Point3[] world=new Point3[matches.size()];Point[] pixels=new Point[matches.size()];
         for(int i=0;i<matches.size();i++){
@@ -111,7 +151,7 @@ final class Vision implements AutoCloseable {
         MatOfDouble distortion=new MatOfDouble();
         try{
             k.put(0,0,s.fx,0,s.cx,0,s.fy,s.cy,0,0,1);
-            if(!Calib3d.solvePnPRansac(obj,uv,k,distortion,r,t,false,240,3.5f,0.995,indices,Calib3d.SOLVEPNP_EPNP))return null;
+            if(!Calib3d.solvePnPRansac(obj,uv,k,distortion,r,t,false,iterations,3.5f,0.995,indices,Calib3d.SOLVEPNP_EPNP))return null;
             inliers=(int)indices.total();
             if(inliers<13 || inliers<matches.size()*0.35)return null;
             int[] ids=new int[inliers];indices.get(0,0,ids);
@@ -132,11 +172,17 @@ final class Vision implements AutoCloseable {
                 if(v[2]<0.1 || v[2]>16)return null;
                 error+=Math.pow(s.fx*v[0]/v[2]+s.cx-goodUv[j].x,2)+Math.pow(s.fy*v[1]/v[2]+s.cy-goodUv[j].y,2);
             }
+            reprojectionError=Math.sqrt(error/inliers);
             if(error/inliers>7.0)return null;
             return cvFromMap.inverse().times(new Rigid(new double[3],new double[]{1,0,0,0}));
         }catch(CvException | IllegalArgumentException degenerate){
             return null;
         }finally{obj.release();uv.release();k.release();r.release();t.release();indices.release();distortion.release();}
     }
-    public void close(){for(Shot shot:history)shot.close();history.clear();if(mapDescriptors!=null){mapDescriptors.release();mapDescriptors=null;}}
+    public void close(){
+        for(Shot shot:history)shot.close();
+        history.clear();
+        if(mapDescriptors!=null){mapDescriptors.release();mapDescriptors=null;}
+        gray.release();noMask.release();detectedKeys.release();luminance=new byte[0];
+    }
 }
