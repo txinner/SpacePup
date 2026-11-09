@@ -16,6 +16,7 @@ import java.util.*;
 
 final class Engine implements GLSurfaceView.Renderer {
     enum Mode { HOME, ORIGIN, SCAN, SEARCH, VISUAL, INERTIAL }
+    enum Tracking { AUTO_CORRECT, MANUAL_CORRECT, LIVE_CAMERA }
     interface Listener {void status(Mode mode,String title,String detail,boolean saveReady);void message(String text);void saved(String name);void failed(String error);}
     final Context context;final Listener ui;final Motion motion;final File dir;
     final Scene scene=new Scene();
@@ -29,6 +30,7 @@ final class Engine implements GLSurfaceView.Renderer {
     private final float[] projection=new float[16];
     private long sampleTime,uiTime,previousFrame,stationarySince;
     private boolean place, setOrigin, closeAfterFix=true;
+    private boolean autoCorrect, autoAttemptUsed, automaticSearch;
     private double lastCorrection=Double.NaN;
     private Rigid oldEstimate;
     private long searchStarted;
@@ -45,8 +47,10 @@ final class Engine implements GLSurfaceView.Renderer {
     public void onSurfaceChanged(GL10 gl,int w,int h){
         width=w;height=h;glViewport(0,0,w,h);if(session!=null)session.setDisplayGeometry(rotation,w,h);
     }
-    void start(Space target,boolean creating,int displayRotation,boolean closeCamera){
-        reset();suspended=false;trace.clear();traceTime=0;lastCorrection=Double.NaN;space=target;rotation=displayRotation;closeAfterFix=closeCamera;
+    void start(Space target,boolean creating,int displayRotation,Tracking tracking){
+        reset();suspended=false;trace.clear();traceTime=0;lastCorrection=Double.NaN;space=target;rotation=displayRotation;
+        closeAfterFix=tracking!=Tracking.LIVE_CAMERA;
+        autoCorrect=tracking==Tracking.AUTO_CORRECT;autoAttemptUsed=false;automaticSearch=false;
         mode=creating?Mode.ORIGIN:Mode.SEARCH;motion.start();openCamera();
     }
     private void openCamera(){
@@ -99,11 +103,11 @@ final class Engine implements GLSurfaceView.Renderer {
     }
     void recalibrate(boolean thenClose){
         if(mode!=Mode.INERTIAL)return;
-        oldEstimate=motion.display();canReturnToImu=oldEstimate!=null;mode=Mode.SEARCH;closeAfterFix=thenClose;openCamera();
+        oldEstimate=motion.display();canReturnToImu=true;mode=Mode.SEARCH;closeAfterFix=thenClose;openCamera();
     }
     void returnToImu(){
         if(mode!=Mode.SEARCH || !canReturnToImu)return;
-        releaseCamera();mode=Mode.INERTIAL;oldEstimate=null;canReturnToImu=false;uiTime=0;
+        releaseCamera();mode=Mode.INERTIAL;oldEstimate=null;canReturnToImu=false;automaticSearch=false;uiTime=0;
     }
     void requestSleep(){
         if(mode==Mode.VISUAL){closeAfterFix=true;stationary=null;stationarySince=0;}
@@ -126,13 +130,16 @@ final class Engine implements GLSurfaceView.Renderer {
             endValidation();
             if(session!=null && resumed){session.pause();resumed=false;}
         }else{
-            releaseCamera();mode=Mode.SEARCH;oldEstimate=null;canReturnToImu=false;
+            boolean keepCameraOff=mode==Mode.INERTIAL || canReturnToImu;
+            releaseCamera();mode=keepCameraOff?Mode.INERTIAL:Mode.SEARCH;
+            oldEstimate=null;canReturnToImu=false;automaticSearch=false;
         }
     }
     void resumeForeground(){
         if(mode==Mode.HOME)return;
         suspended=false;
         motion.start();
+        if(mode==Mode.INERTIAL)return;
         if(session==null){openCamera();return;}
         if(!resumed)try{session.resume();resumed=true;}catch(Exception e){fail(e);}
     }
@@ -144,15 +151,22 @@ final class Engine implements GLSurfaceView.Renderer {
         glClearColor(.047f,.082f,.091f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
         try{
             if(mode==Mode.HOME || suspended)return;
-            if(mode==Mode.SEARCH && canReturnToImu && SystemClock.elapsedRealtime()-searchStarted>18000){
-                returnToImu();ui.message("尚未认出已扫描的空间，已关相机并继续惯性估计");
+            if(mode==Mode.SEARCH && canReturnToImu && SystemClock.elapsedRealtime()-searchStarted>(automaticSearch?6000:18000)){
+                returnToImu();ui.message("还没认出已扫描的空间，已关闭相机");
             }
             if(mode==Mode.SEARCH)record();
             if(mode==Mode.INERTIAL){
-                mapCamera=motion.display();scene.renderDog(projection,mapCamera,space.dog);
-                boolean caution=motion.risk()>0.6;
-                report(caution?"惯性估计 · 建议校正":"惯性跟踪 · 相机已关闭",
-                    poseText()+"\n"+String.format(Locale.US,"关相机 %.0f 秒%s",motion.elapsed(),motion.hasBarometer()?" · 气压辅助高度":""));
+                mapCamera=motion.display();
+                if(motion.positionUsable()){
+                    scene.renderDog(projection,mapCamera,space.dog);
+                    report("惯性跟踪 · 相机已关闭",poseText()+"\n"+String.format(Locale.US,
+                        "关相机 %.0f 秒%s",motion.elapsed(),motion.hasBarometer()?" · 气压辅助高度":""));
+                }else if(autoCorrect && !autoAttemptUsed && mapCamera!=null){
+                    autoAttemptUsed=true;automaticSearch=true;
+                    recalibrate(true);return;
+                }else{
+                    report("小狗已暂时隐藏","手机位置需要重新确认。对准已扫描区域，点「视觉校正」。");
+                }
                 record();return;
             }
             if(session==null)return;
@@ -192,7 +206,7 @@ final class Engine implements GLSurfaceView.Renderer {
                         if(shot!=null){Rigid fix=vision.locate(shot,space,ts);
                             if(fix!=null){
                                 origin=session.createAnchor(toPose(fix.inverse()));mapAR=fix;
-                                mode=Mode.VISUAL;stationary=null;canReturnToImu=false;
+                                mode=Mode.VISUAL;stationary=null;canReturnToImu=false;automaticSearch=false;
                                 if(oldEstimate!=null){Rigid estimateNow=motion.display();
                                     lastCorrection=fix.times(from(cam.getDisplayOrientedPose())).distance(estimateNow==null?oldEstimate:estimateNow);oldEstimate=null;}
                             }
@@ -214,7 +228,7 @@ final class Engine implements GLSurfaceView.Renderer {
                         // SensorEvent uses elapsed realtime. Some camera clocks use another epoch.
                         long seedNs=Math.abs(now-cameraNs)<250000000L?cameraNs:now;
                         if(motion.seed(latestSensor,sensor.inverse().times(display),new double[3],seedNs)){
-                            releaseCamera();mode=Mode.INERTIAL;uiTime=0;
+                            releaseCamera();mode=Mode.INERTIAL;autoAttemptUsed=false;uiTime=0;
                             report("惯性跟踪 · 相机已关闭",poseText());record();return;
                         }
                         if(ts-stationarySince>2500000000L){closeAfterFix=false;ui.message("缺少可同步的惯性数据，已保持视觉定位");}

@@ -24,7 +24,8 @@ public final class MainActivity extends Activity implements Engine.Listener {
     private GLSurfaceView surface;private Engine engine;
     private FrameLayout root,overlay;private TextView statusTitle,statusDetail;
     private LinearLayout actions;private Button save;private Engine.Mode drawn;
-    private File maps;private Space pending;private boolean creating,wantsSleep=true,installAsked,foreground;
+    private File maps;private Space pending;private boolean creating,installAsked,foreground;
+    private Engine.Tracking pendingTracking;
     private boolean inSession;
     private String export="";
     private final Runnable tick=new Runnable(){public void run(){
@@ -85,17 +86,19 @@ public final class MainActivity extends Activity implements Engine.Listener {
         new AlertDialog.Builder(this).setTitle("为空间命名").setView(wrap).setNegativeButton("取消",null)
             .setPositiveButton("开始扫描",(d,w)->{
                 String name=field.getText().toString().trim();if(name.isEmpty())name="我的空间";
-                queue(new Space(name,UUID.randomUUID().toString()),true,true);
+                queue(new Space(name,UUID.randomUUID().toString()),true,Engine.Tracking.MANUAL_CORRECT);
             }).show();
     }
     private void select(File file,String name){
-        new AlertDialog.Builder(this).setTitle(name).setItems(new String[]{"定位后关闭相机","实景查看小狗"},(d,index)->{
-            try{queue(Space.load(file),false,index==0);}
+        Engine.Tracking[] choices={Engine.Tracking.AUTO_CORRECT,Engine.Tracking.MANUAL_CORRECT,Engine.Tracking.LIVE_CAMERA};
+        String[] labels={"定位后关相机，需要时自动校正","定位后关相机，手动校正","实景查看小狗"};
+        new AlertDialog.Builder(this).setTitle(name).setItems(labels,(d,index)->{
+            try{queue(Space.load(file),false,choices[index]);}
             catch(Exception e){dialog("地图读取失败",e.getMessage());}
         }).setNegativeButton("取消",null).show();
     }
-    private void queue(Space space,boolean create,boolean sleep){
-        pending=space;creating=create;wantsSleep=sleep;installAsked=false;begin();
+    private void queue(Space space,boolean create,Engine.Tracking tracking){
+        pending=space;creating=create;pendingTracking=tracking;installAsked=false;begin();
     }
     private void begin(){
         if(pending==null || !foreground)return;
@@ -107,12 +110,12 @@ public final class MainActivity extends Activity implements Engine.Listener {
             System.loadLibrary("opencv_java4");
         }catch(Exception | LinkageError e){pending=null;
             dialog("无法启动空间扫描","需要支持 ARCore 的 64 位 Android 手机，并安装可用的 Google Play Services for AR。\n"+e.getClass().getSimpleName());return;}
-        Space target=pending;pending=null;boolean create=creating,sleep=wantsSleep;inSession=true;
+        Space target=pending;pending=null;boolean create=creating;Engine.Tracking tracking=pendingTracking;inSession=true;
         handler.removeCallbacks(tick);handler.post(tick);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         hud(create?Engine.Mode.ORIGIN:Engine.Mode.SEARCH);
         int rotation=getWindowManager().getDefaultDisplay().getRotation();
-        event(()->engine.start(target,create,rotation,sleep));
+        event(()->engine.start(target,create,rotation,tracking));
     }
     @Override public void onRequestPermissionsResult(int code,String[] permissions,int[] grants){
         super.onRequestPermissionsResult(code,permissions,grants);

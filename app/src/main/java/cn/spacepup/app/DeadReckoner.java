@@ -2,6 +2,9 @@ package cn.spacepup.app;
 
 /** Short-horizon inertial propagation in the saved map's gravity-aligned frame (+Y up). */
 final class DeadReckoner {
+    private static final double REST_CONFIRM_SECONDS = 0.36;
+    private static final double REST_ACCELERATION = 0.21;
+    private static final double START_ACCELERATION = 0.32;
     Rigid mapFromSensor, mapFromInertial;
     double[] velocity=new double[3],previousA=new double[3],deviceBias=new double[3];
     long firstNs,lastNs; double stillSeconds,elapsed, movingTime,path;
@@ -10,7 +13,7 @@ final class DeadReckoner {
     void seed(Rigid sensorPose,Rigid inertialFromSensor,double[] v,long ns,double pressure){
         mapFromSensor=sensorPose;mapFromInertial=sensorPose.times(inertialFromSensor.inverse());
         velocity=v.clone();previousA=new double[3];deviceBias=new double[3];
-        firstNs=ns;lastNs=0;stillSeconds=0;elapsed=0;movingTime=0;path=0;interrupted=false;live=true;
+        firstNs=ns;lastNs=0;stillSeconds=Rigid.norm(v)<0.01?REST_CONFIRM_SECONDS:0;elapsed=0;movingTime=0;path=0;interrupted=false;live=true;
         basePressure=pressure;originHeight=sensorPose.t[1];filteredHeight=originHeight;
     }
     void rotate(Rigid inertialFromSensor){
@@ -29,11 +32,19 @@ final class DeadReckoner {
         lastNs=ns;
         double[] a=mapFromSensor.rotate(Rigid.sub(deviceA,deviceBias));
         if(includesGravity)a[1]-=9.80665;
-        if(dt<=0 || dt>0.22){if(dt>0.22){interrupted=true;velocity=new double[3];}previousA=a;return;}
-        if(Rigid.norm(a)<0.21 && gyroRate<0.06)stillSeconds+=dt;else stillSeconds=0;
-        if(stillSeconds>=0.36){
+        if(dt<=0 || dt>0.22){if(dt>0.22){interrupted=true;velocity=new double[3];}return;}
+        double acceleration=Rigid.norm(a);
+        boolean wasStill=stillSeconds>=REST_CONFIRM_SECONDS;
+        if(wasStill && acceleration<START_ACCELERATION
+            || acceleration<REST_ACCELERATION && gyroRate<0.06 && Rigid.norm(velocity)<0.30){
+            stillSeconds=Math.min(REST_CONFIRM_SECONDS,stillSeconds+dt);
+        }else stillSeconds=0;
+        if(stillSeconds>=REST_CONFIRM_SECONDS){
             velocity=new double[3];previousA=new double[3];
-            double k=1-Math.exp(-dt/3);deviceBias=Rigid.add(deviceBias,Rigid.scale(mapFromSensor.inverse().rotate(a),k));
+            if(gyroRate<0.06 && acceleration<REST_ACCELERATION){
+                double k=1-Math.exp(-dt/3);
+                deviceBias=Rigid.add(deviceBias,Rigid.scale(mapFromSensor.inverse().rotate(a),k));
+            }
             return;
         }
         movingTime+=dt;
@@ -49,9 +60,10 @@ final class DeadReckoner {
         filteredHeight+=(h-filteredHeight)*(1-Math.exp(-Math.min(dt,1.0)/1.4));
         double[] p=mapFromSensor.t.clone();double residual=filteredHeight-p[1];
         p[1]+=residual*(1-Math.exp(-Math.min(dt,1.0)/1.1));
-        if(stillSeconds<0.36)velocity[1]+=Math.max(-3,Math.min(3,residual))*Math.min(dt,.5)*0.16;
+        if(stillSeconds<REST_CONFIRM_SECONDS)velocity[1]+=Math.max(-3,Math.min(3,residual))*Math.min(dt,.5)*0.16;
         mapFromSensor=new Rigid(p,mapFromSensor.q);
     }
     // A caution indicator only, not a statistically calibrated error bound.
     double risk(){return interrupted?Double.POSITIVE_INFINITY:0.05+0.025*movingTime+0.012*movingTime*movingTime+0.018*path;}
+    boolean positionUsable(){return live && risk()<0.25 && elapsed<30;}
 }

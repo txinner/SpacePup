@@ -122,12 +122,34 @@ public final class Replay {
         require(Rigid.norm(nav.mapFromSensor.t)<.10,"return after rotating on 3D path");
         System.out.printf(Locale.ROOT,"Ideal IMU loop endpoint %.5f m (noise-free signals)%n",Rigid.norm(nav.mapFromSensor.t));
     }
+    static void driftGuard(){
+        DeadReckoner nav=new DeadReckoner();
+        nav.seed(Rigid.ID,Rigid.ID,new double[3],0,Double.NaN);
+        long ns=0;
+        for(int i=0;i<300;i++){
+            ns+=20000000;
+            nav.rotate(Rigid.yaw(new double[3],i*.016));
+            nav.advance(ns,new double[]{.24,0,0},false,.8);
+        }
+        require(nav.mapFromSensor.distance(Rigid.ID)<1e-8,"rotation with residual acceleration adds translation");
+        require(nav.positionUsable(),"rotation prematurely invalidates position");
+        for(int i=0;i<250;i++){
+            ns+=20000000;
+            nav.advance(ns,new double[]{i<30?1:0,0,0},false,0);
+        }
+        require(nav.mapFromSensor.distance(Rigid.ID)>2,"constant velocity mistaken for rest");
+        require(!nav.positionUsable(),"growing displacement uncertainty stays visible");
+        nav.seed(Rigid.ID,Rigid.ID,new double[3],ns,Double.NaN);
+        require(nav.positionUsable(),"visual reseed does not reset uncertainty");
+        for(int i=0;i<1550;i++){ns+=20000000;nav.advance(ns,new double[3],false,0);}
+        require(!nav.positionUsable(),"inertial window did not expire");
+    }
     public static void main(String[] args)throws Exception{
         System.load(args[0]);run(Files.createTempDirectory("spacepup-replay-"));
     }
     static int run(Path dir)throws Exception{
         checks=0;
-        try{vision(dir);motion();stairs();System.out.println("PASS · "+checks+" checks");return checks;}
+        try{vision(dir);motion();stairs();driftGuard();System.out.println("PASS · "+checks+" checks");return checks;}
         finally{Files.deleteIfExists(dir.resolve("fixture.pup"));Files.deleteIfExists(dir);}
     }
 }

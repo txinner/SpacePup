@@ -4,6 +4,7 @@ import android.content.Context;
 import android.hardware.*;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import java.util.ArrayDeque;
 
 /** Registered only while a space session is in the foreground. Sensor poses use Android native axes. */
@@ -51,7 +52,11 @@ final class Motion implements SensorEventListener {
         nav.rotate(orientations.peekLast().r);sensorFromDisplay=sensorDisplay;return true;
     }
     synchronized Rigid display(){return nav.live?nav.mapFromSensor.times(sensorFromDisplay):null;}
-    synchronized double risk(){return nav.risk();}
+    synchronized boolean positionUsable(){
+        long now=SystemClock.elapsedRealtimeNanos();
+        return nav.positionUsable() && !orientations.isEmpty()
+            && now-accelNs<500000000L && now-orientations.peekLast().t<500000000L;
+    }
     synchronized double elapsed(){return nav.elapsed;}
     synchronized boolean hasBarometer(){return Double.isFinite(pressureValue);}
     public synchronized void onSensorChanged(SensorEvent e){
