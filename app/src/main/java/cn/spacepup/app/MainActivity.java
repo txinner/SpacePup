@@ -25,21 +25,20 @@ public final class MainActivity extends Activity implements Engine.Listener {
     private FrameLayout root,overlay;private TextView statusTitle,statusDetail;
     private LinearLayout actions;private Button save;private Engine.Mode drawn;
     private File maps;private Space pending;private boolean creating,installAsked,foreground;
-    private Engine.Tracking pendingTracking;
     private boolean inSession;
     private String export="";
     private final Runnable tick=new Runnable(){public void run(){
         if(!foreground || !inSession)return;
         surface.requestRender();
         Engine.Mode current=engine.mode;
-        handler.postDelayed(this,current==Engine.Mode.VISUAL?100:current==Engine.Mode.INERTIAL?64:32);
+        handler.postDelayed(this,current==Engine.Mode.VISUAL?100:32);
     }};
     @Override public void onCreate(Bundle state){
         super.onCreate(state);getWindow().setStatusBarColor(INK);getWindow().setNavigationBarColor(INK);
         maps=new File(getFilesDir(),"spaces");if(!maps.isDirectory() && !maps.mkdirs()){Toast.makeText(this,"空间目录创建失败",Toast.LENGTH_LONG).show();}
         root=new FrameLayout(this);surface=new GLSurfaceView(this);surface.setEGLContextClientVersion(2);
         surface.setEGLConfigChooser(8,8,8,8,16,0);surface.setPreserveEGLContextOnPause(true);
-        engine=new Engine(getApplicationContext(),new Motion(this),maps,this);
+        engine=new Engine(getApplicationContext(),maps,this);
         surface.setRenderer(engine);surface.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
         root.addView(surface);overlay=new FrameLayout(this);root.addView(overlay);setContentView(root);home();
     }
@@ -75,7 +74,7 @@ public final class MainActivity extends Activity implements Engine.Listener {
                     in.readInt();name=in.readUTF();
                 }catch(IOException e){name="无法读取的空间";}
                 final String title=name;
-                Button item=button(title+"　›",false,()->select(f,title));item.setGravity(Gravity.START|Gravity.CENTER_VERTICAL);item.setPadding(dp(16),0,dp(12),0);add(body,item,10);
+                Button item=button(title+"　›",false,()->select(f));item.setGravity(Gravity.START|Gravity.CENTER_VERTICAL);item.setPadding(dp(16),0,dp(12),0);add(body,item,10);
             }
         }
         if(!export.isEmpty())add(body,button("导出上一段定位记录",false,this::exportCsv),26);
@@ -87,19 +86,15 @@ public final class MainActivity extends Activity implements Engine.Listener {
         new AlertDialog.Builder(this).setTitle("为空间命名").setView(wrap).setNegativeButton("取消",null)
             .setPositiveButton("开始扫描",(d,w)->{
                 String name=field.getText().toString().trim();if(name.isEmpty())name="我的空间";
-                queue(new Space(name,UUID.randomUUID().toString()),true,Engine.Tracking.MANUAL_CORRECT);
+                queue(new Space(name,UUID.randomUUID().toString()),true);
             }).show();
     }
-    private void select(File file,String name){
-        Engine.Tracking[] choices={Engine.Tracking.LIVE_CAMERA,Engine.Tracking.AUTO_CORRECT,Engine.Tracking.MANUAL_CORRECT};
-        String[] labels={"持续视觉定位","定位后关相机，需要时自动校正","定位后关相机，手动校正"};
-        new AlertDialog.Builder(this).setTitle(name).setItems(labels,(d,index)->{
-            try{queue(Space.load(file),false,choices[index]);}
-            catch(Exception e){dialog("地图读取失败",e.getMessage());}
-        }).setNegativeButton("取消",null).show();
+    private void select(File file){
+        try{queue(Space.load(file),false);}
+        catch(Exception e){dialog("地图读取失败",e.getMessage());}
     }
-    private void queue(Space space,boolean create,Engine.Tracking tracking){
-        pending=space;creating=create;pendingTracking=tracking;installAsked=false;begin();
+    private void queue(Space space,boolean create){
+        pending=space;creating=create;installAsked=false;begin();
     }
     private void begin(){
         if(pending==null || !foreground)return;
@@ -111,17 +106,17 @@ public final class MainActivity extends Activity implements Engine.Listener {
             System.loadLibrary("opencv_java4");
         }catch(Exception | LinkageError e){pending=null;
             dialog("无法启动空间扫描","需要支持 ARCore 的 64 位 Android 手机，并安装可用的 Google Play Services for AR。\n"+e.getClass().getSimpleName());return;}
-        Space target=pending;pending=null;boolean create=creating;Engine.Tracking tracking=pendingTracking;inSession=true;
+        Space target=pending;pending=null;boolean create=creating;inSession=true;
         handler.removeCallbacks(tick);handler.post(tick);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         hud(create?Engine.Mode.ORIGIN:Engine.Mode.SEARCH);
         int rotation=getWindowManager().getDefaultDisplay().getRotation();
-        event(()->engine.start(target,create,rotation,tracking));
+        event(()->engine.start(target,create,rotation));
     }
     @Override public void onRequestPermissionsResult(int code,String[] permissions,int[] grants){
         super.onRequestPermissionsResult(code,permissions,grants);
         if(code==71){if(grants.length>0 && grants[0]==PackageManager.PERMISSION_GRANTED)begin();
-            else{pending=null;dialog("需要相机权限","创建空间和重新定位需要相机权限。可以在系统设置中授权。");}}
+            else{pending=null;dialog("需要相机权限","创建空间和持续视觉定位需要相机权限。可以在系统设置中授权。");}}
     }
     private void dialog(String title,String detail){
         if(isFinishing() || isDestroyed())return;
@@ -143,8 +138,6 @@ public final class MainActivity extends Activity implements Engine.Listener {
         actions=new LinearLayout(this);actions.setOrientation(LinearLayout.HORIZONTAL);add(bottom,actions,0);save=null;
         if(m==Engine.Mode.ORIGIN)action("设为原点",true,engine::actionOrigin);
         if(m==Engine.Mode.SCAN){action("放置小狗",false,engine::actionPlace);save=action("保存空间",true,engine::save);}
-        if(m==Engine.Mode.INERTIAL){action("视觉校正",true,()->engine.recalibrate(true));action("实景查看",false,()->engine.recalibrate(false));}
-        if(m==Engine.Mode.SEARCH && engine.canReturnToImu)action("继续惯性跟踪",false,engine::returnToImu);
         Button exit=button("返回空间列表",false,this::exitSession);add(bottom,exit,actions.getChildCount()>0?8:0);
     }
     private Button action(String title,boolean primary,Runnable run){

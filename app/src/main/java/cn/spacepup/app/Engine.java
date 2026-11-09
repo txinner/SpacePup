@@ -15,10 +15,9 @@ import java.io.File;
 import java.util.*;
 
 final class Engine implements GLSurfaceView.Renderer {
-    enum Mode { HOME, ORIGIN, SCAN, SEARCH, VISUAL, INERTIAL }
-    enum Tracking { AUTO_CORRECT, MANUAL_CORRECT, LIVE_CAMERA }
+    enum Mode { HOME, ORIGIN, SCAN, SEARCH, VISUAL }
     interface Listener {void status(Mode mode,String title,String detail,boolean saveReady);void message(String text);void saved(String name);void failed(String error);}
-    final Context context;final Listener ui;final Motion motion;final File dir;
+    final Context context;final Listener ui;final File dir;
     final Scene scene=new Scene();
     volatile Mode mode=Mode.HOME;
     private Session session;private boolean resumed,suspended;
@@ -26,21 +25,17 @@ final class Engine implements GLSurfaceView.Renderer {
     private Rigid validationStart;
     private long validationSince;
     private int width=1,height=1,rotation;
-    private Rigid mapCamera, stationary, latestSensor;
+    private Rigid mapCamera;
     private final MapRefresh mapRefresh=new MapRefresh();
     private long lastMapMatch;
     private final float[] projection=new float[16];
-    private long sampleTime,uiTime,previousFrame,stationarySince;
-    private boolean place, setOrigin, closeAfterFix=true;
-    private boolean autoCorrect, autoAttemptUsed, automaticSearch;
+    private long sampleTime,uiTime;
+    private boolean place, setOrigin;
     private double lastCorrection=Double.NaN;
-    private Rigid oldEstimate;
-    private long searchStarted;
-    volatile boolean canReturnToImu;
     private long traceTime;
     private long lastChargeRead=-10000,charge;
     final ArrayDeque<String> trace=new ArrayDeque<>();
-    Engine(Context ctx,Motion motion,File dir,Listener ui){context=ctx;this.motion=motion;this.dir=dir;this.ui=ui;}
+    Engine(Context ctx,File dir,Listener ui){context=ctx;this.dir=dir;this.ui=ui;}
     static Rigid from(Pose p){return new Rigid(Rigid.doubles(p.getTranslation()),Rigid.doubles(p.getRotationQuaternion()));}
     static Pose toPose(Rigid p){return new Pose(Rigid.floats(p.t),Rigid.floats(p.q));}
     public void onSurfaceCreated(GL10 gl,EGLConfig config){
@@ -50,12 +45,9 @@ final class Engine implements GLSurfaceView.Renderer {
         width=w;height=h;glViewport(0,0,w,h);scene.invalidateCameraGeometry();
         if(session!=null)session.setDisplayGeometry(rotation,w,h);
     }
-    void start(Space target,boolean creating,int displayRotation,Tracking tracking){
+    void start(Space target,boolean creating,int displayRotation){
         reset();suspended=false;trace.clear();traceTime=0;lastCorrection=Double.NaN;space=target;rotation=displayRotation;
-        closeAfterFix=tracking!=Tracking.LIVE_CAMERA;
-        autoCorrect=tracking==Tracking.AUTO_CORRECT;autoAttemptUsed=false;automaticSearch=false;
         mode=creating?Mode.ORIGIN:Mode.SEARCH;
-        if(closeAfterFix && !creating)motion.start();
         openCamera();
     }
     private void openCamera(){
@@ -77,11 +69,10 @@ final class Engine implements GLSurfaceView.Renderer {
             session.configure(config);session.setCameraTextureName(scene.texture);
             scene.invalidateCameraGeometry();
             session.setDisplayGeometry(rotation,width,height);session.resume();resumed=true;
-            sampleTime=0;previousFrame=0;stationarySince=0;stationary=null;mapCamera=null;searchStarted=SystemClock.elapsedRealtime();
+            sampleTime=0;mapCamera=null;
             lastMapMatch=0;mapRefresh.reset(0,false);
         }catch(Exception | LinkageError e){
-            if(canReturnToImu){returnToImu();ui.message("相机暂时不可用，已恢复惯性估计");}
-            else fail(e);
+            fail(e);
         }
     }
     void actionOrigin(){if(mode==Mode.ORIGIN)setOrigin=true;}
@@ -117,14 +108,6 @@ final class Engine implements GLSurfaceView.Renderer {
         }
         report("保存前复核 · 从新位置看向扫描区","横移至少 20 厘米并稳住手机，现实场景须与已建地图对齐\n连续验证 "+validator.confirmations+" / 3");
     }
-    void recalibrate(boolean thenClose){
-        if(mode!=Mode.INERTIAL)return;
-        oldEstimate=motion.display();canReturnToImu=true;mode=Mode.SEARCH;closeAfterFix=thenClose;openCamera();
-    }
-    void returnToImu(){
-        if(mode!=Mode.SEARCH || !canReturnToImu)return;
-        releaseCamera();mode=Mode.INERTIAL;oldEstimate=null;canReturnToImu=false;automaticSearch=false;uiTime=0;
-    }
     private void releaseCamera(){
         endValidation();
         if(placedDog!=null){placedDog.detach();placedDog=null;}
@@ -133,27 +116,22 @@ final class Engine implements GLSurfaceView.Renderer {
         if(vision!=null){vision.close();vision=null;}
     }
     void reset(){
-        releaseCamera();motion.stop();mode=Mode.HOME;space=null;mapCamera=null;oldEstimate=null;
-        setOrigin=false;place=false;uiTime=0;canReturnToImu=false;
+        releaseCamera();mode=Mode.HOME;space=null;mapCamera=null;
+        setOrigin=false;place=false;uiTime=0;
     }
     void suspend(){
         if(mode==Mode.HOME)return;
         suspended=true;
-        motion.stop();
         if(mode==Mode.SCAN || mode==Mode.ORIGIN){
             endValidation();
             if(session!=null && resumed){session.pause();resumed=false;}
         }else{
-            boolean keepCameraOff=mode==Mode.INERTIAL || canReturnToImu;
-            releaseCamera();mode=keepCameraOff?Mode.INERTIAL:Mode.SEARCH;
-            oldEstimate=null;canReturnToImu=false;automaticSearch=false;
+            releaseCamera();mode=Mode.SEARCH;mapCamera=null;
         }
     }
     void resumeForeground(){
         if(mode==Mode.HOME)return;
         suspended=false;
-        if(closeAfterFix && mode!=Mode.SCAN && mode!=Mode.ORIGIN || mode==Mode.INERTIAL)motion.start();
-        if(mode==Mode.INERTIAL)return;
         if(session==null){openCamera();return;}
         if(!resumed)try{session.resume();resumed=true;}catch(Exception e){fail(e);}
     }
@@ -165,31 +143,13 @@ final class Engine implements GLSurfaceView.Renderer {
         glClearColor(.047f,.082f,.091f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
         try{
             if(mode==Mode.HOME || suspended)return;
-            if(mode==Mode.SEARCH && canReturnToImu && SystemClock.elapsedRealtime()-searchStarted>(automaticSearch?6000:18000)){
-                returnToImu();ui.message("还没认出已扫描的空间，已关闭相机");
-            }
             if(mode==Mode.SEARCH)record();
-            if(mode==Mode.INERTIAL){
-                mapCamera=motion.display();
-                if(motion.positionUsable()){
-                    scene.renderDog(projection,mapCamera,space.dog);
-                    report("惯性跟踪 · 相机已关闭",poseText()+"\n"+String.format(Locale.US,
-                        "关相机 %.0f 秒%s",motion.elapsed(),motion.hasBarometer()?" · 气压辅助高度":""));
-                }else if(autoCorrect && !autoAttemptUsed && mapCamera!=null){
-                    autoAttemptUsed=true;automaticSearch=true;
-                    recalibrate(true);return;
-                }else{
-                    report("小狗已暂时隐藏","手机位置需要重新确认。对准已扫描区域，点「视觉校正」。");
-                }
-                record();return;
-            }
             if(session==null)return;
             Frame frame=session.update();Camera cam=frame.getCamera();long ts=frame.getTimestamp();
             if(ts==0)return;
             scene.background(frame);
             if(cam.getTrackingState()!=TrackingState.TRACKING || mode==Mode.SCAN && origin.getTrackingState()!=TrackingState.TRACKING){
                 vision.resetConfirmation();
-                stationary=null;
                 report("视觉跟踪尚未就绪","缓慢移动手机，对准有纹理的物体 · "+cam.getTrackingFailureReason());return;
             }
             cam.getProjectionMatrix(projection,0,0.05f,120f);
@@ -227,12 +187,9 @@ final class Engine implements GLSurfaceView.Renderer {
                         if(shot!=null){Rigid fix=vision.locate(shot,space,ts);
                             if(fix!=null){
                                 anchorDog(fix);mapAR=fix;
-                                mode=Mode.VISUAL;stationary=null;canReturnToImu=false;automaticSearch=false;
+                                mode=Mode.VISUAL;
                                 vision.resetConfirmation();lastMapMatch=ts;
                                 mapRefresh.reset(ts,space.nearMappedView(fix.point(arCamera.t)));
-                                if(oldEstimate!=null){Rigid estimateNow=motion.display();
-                                    lastCorrection=fix.times(from(cam.getDisplayOrientedPose())).distance(estimateNow==null?oldEstimate:estimateNow);oldEstimate=null;}
-                                if(!closeAfterFix)motion.stop();
                             }
                         }
                     }
@@ -241,38 +198,20 @@ final class Engine implements GLSurfaceView.Renderer {
                     "对准扫描过的家具或墙角，慢慢移动\n匹配内点 "+vision.inliers+"　画面分区 "+vision.sectors+"　连续验证 "+vision.confirmations+" / 3");return;}
             }
             if(mode==Mode.VISUAL){
-                if(!closeAfterFix)mapAR=correctAgainstMap(frame,cam,arCamera,mapAR,ts);
+                mapAR=correctAgainstMap(frame,cam,arCamera,mapAR,ts);
                 if(mapAR==null){
                     report("正在找回小狗的位置","对准放置小狗时看到的地面、墙角或家具。");return;
                 }
                 Rigid display=from(cam.getDisplayOrientedPose());
                 mapCamera=mapAR.times(display);
                 scene.renderDog(projection,mapCamera,space.dog);
-                if(closeAfterFix && previousFrame!=ts){
-                    Rigid sensor=from(frame.getAndroidSensorPose());
-                    latestSensor=mapAR.times(sensor);
-                    if(stationary==null || latestSensor.distance(stationary)>0.018 || latestSensor.angle(stationary)>Math.toRadians(2)){
-                        stationary=latestSensor;stationarySince=ts;
-                    }else if(ts-stationarySince>600000000L){
-                        long now=SystemClock.elapsedRealtimeNanos(),cameraNs=frame.getAndroidCameraTimestamp();
-                        // SensorEvent uses elapsed realtime. Some camera clocks use another epoch.
-                        long seedNs=Math.abs(now-cameraNs)<250000000L?cameraNs:now;
-                        if(motion.seed(latestSensor,sensor.inverse().times(display),new double[3],seedNs)){
-                            releaseCamera();mode=Mode.INERTIAL;autoAttemptUsed=false;uiTime=0;
-                            report("惯性跟踪 · 相机已关闭",poseText());record();return;
-                        }
-                        if(ts-stationarySince>2500000000L){closeAfterFix=false;ui.message("缺少可同步的惯性数据，已保持视觉定位");}
-                    }
-                }
-                String status=closeAfterFix?"已定位 · 请稳住手机以关闭相机":
-                    mapRefresh.inside?"持续视觉定位 · 扫描区内":"视觉跟踪 · 扫描区外";
-                String matchStatus=!closeAfterFix && mapRefresh.inside && ts-lastMapMatch>12000000000L
+                String status=mapRefresh.inside?"持续视觉定位 · 扫描区内":"视觉跟踪 · 扫描区外";
+                String matchStatus=mapRefresh.inside && ts-lastMapMatch>12000000000L
                     ?"\n等待自动匹配已扫描特征":"";
                 report(status,poseText()+matchStatus+(Double.isFinite(lastCorrection)?
                     String.format(Locale.CHINA,"\n上次视觉校正 %.2f m",lastCorrection):""));
                 record();
             }
-            previousFrame=ts;
         }catch(Exception | LinkageError e){fail(e);}
     }
     private void anchorDog(Rigid mapFromAr){
